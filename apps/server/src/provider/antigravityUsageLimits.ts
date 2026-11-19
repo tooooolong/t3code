@@ -15,6 +15,11 @@ import {
   makeUsageLimits,
 } from "@t3tools/provider-core/server/usageLimits";
 
+import type {
+  AntigravityStatusLineReadResult,
+  AntigravityStatusLineSnapshot,
+} from "./antigravityStatusLineProbe.ts";
+
 export function antigravityUserAgent(platform: NodeJS.Platform, architecture: NodeJS.Architecture) {
   return `antigravity/hub/2.24.0 (aidev_client; os_type=${platform}; arch=${architecture}; cl=963137146)`;
 }
@@ -42,7 +47,10 @@ const TokenResponse = Schema.Struct({
   access_token: Schema.NonEmptyString,
   expires_in: Schema.Number.check(Schema.isGreaterThan(0)),
 });
-const UserInfo = Schema.Struct({ id: Schema.NonEmptyString });
+const UserInfo = Schema.Struct({
+  id: Schema.NonEmptyString,
+  email: Schema.optional(Schema.String),
+});
 const Quota = Schema.Struct({
   remainingFraction: Schema.optional(Schema.Number),
   resetTime: Schema.optional(Schema.String),
@@ -207,9 +215,21 @@ function modelWindows(models: typeof Models.Type) {
   return [...windows.values()];
 }
 
+/** Windows from an Antigravity CLI `statusLine` snapshot observed at `requestedAt`. */
+const antigravityStatusLineWindows = (
+  snapshot: AntigravityStatusLineSnapshot,
+  requestedAt: number,
+): ReadonlyArray<ServerProviderUsageWindow> =>
+  summaryWindows({ buckets: snapshot.buckets }, requestedAt);
+
 export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(function* (input: {
   readonly profileDirectory: string;
   readonly authMethod: AntigravitySettings["authMethod"];
+  readonly readStatusLine?: Effect.Effect<AntigravityStatusLineReadResult>;
+  readonly onAccountObserved?: (account: {
+    readonly email?: string;
+    readonly planTier?: string;
+  }) => Effect.Effect<void>;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -238,6 +258,51 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
     }
     if (!(yield* fs.exists(tokenPath))) {
       cached = undefined;
+      if (input.readStatusLine !== undefined) {
+        const statusLine = yield* input.readStatusLine;
+        if (statusLine._tag === "ok") {
+          const { snapshot, requestedAt } = statusLine;
+          if (
+            input.onAccountObserved !== undefined &&
+            generation === startedGeneration &&
+            (snapshot.email !== undefined || snapshot.planTier !== undefined)
+          ) {
+            yield* input
+              .onAccountObserved({
+                ...(snapshot.email ? { email: snapshot.email } : {}),
+                ...(snapshot.planTier ? { planTier: snapshot.planTier } : {}),
+              })
+              .pipe(Effect.ignore);
+          }
+          const windows = antigravityStatusLineWindows(snapshot, requestedAt);
+          if (windows.length === 0) {
+            const hasAmountOnlyQuota = snapshot.buckets.some(
+              (bucket) => !bucket.disabled && bucket.remainingAmount !== undefined,
+            );
+            return makeUnavailableUsageLimits({
+              checkedAt,
+              reason: hasAmountOnlyQuota ? "unsupported" : "probeFailed",
+              message: hasAmountOnlyQuota
+                ? "Antigravity reported quota balances without percentages."
+                : "Antigravity did not return usable quota information.",
+            });
+          }
+          const credentialFingerprint = snapshot.email
+            ? yield* sha256(`google-email\0${snapshot.email.trim().toLowerCase()}`)
+            : undefined;
+          return {
+            ...makeUsageLimits({ checkedAt, windows }),
+            ...(credentialFingerprint ? { credentialFingerprint } : {}),
+          };
+        }
+        if (statusLine._tag === "failed") {
+          return makeUnavailableUsageLimits({
+            checkedAt,
+            reason: "probeFailed",
+            message: "Could not read Antigravity limits. Refresh provider status to retry.",
+          });
+        }
+      }
       return makeUnavailableUsageLimits({
         checkedAt,
         reason: "unsupported",
@@ -265,14 +330,25 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
       ).pipe(Effect.flatMap(decodeTokenResponse));
       accessToken = refreshed.access_token;
       // Use Google account IDs to merge accounts across environments; refresh tokens differ per machine.
-      account = yield* request(
+      const userInfo = yield* request(
         HttpClientRequest.get("https://www.googleapis.com/oauth2/v2/userinfo").pipe(
           HttpClientRequest.setHeaders({ Authorization: `Bearer ${accessToken}` }),
         ),
-      ).pipe(
-        Effect.flatMap(antigravityAccountFingerprint),
-        Effect.orElseSucceed(() => fingerprint),
-      );
+      ).pipe(Effect.flatMap(decodeUserInfo), Effect.option);
+      const observedEmail =
+        Option.isSome(userInfo) && userInfo.value.email?.trim()
+          ? userInfo.value.email.trim()
+          : undefined;
+      if (
+        observedEmail !== undefined &&
+        input.onAccountObserved !== undefined &&
+        generation === startedGeneration
+      ) {
+        yield* input.onAccountObserved({ email: observedEmail }).pipe(Effect.ignore);
+      }
+      account = Option.isSome(userInfo)
+        ? yield* sha256(`google-account\0${userInfo.value.id}`)
+        : fingerprint;
       if (generation === startedGeneration) {
         cached = {
           fingerprint,

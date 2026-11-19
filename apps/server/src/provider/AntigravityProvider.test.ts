@@ -806,4 +806,38 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
       expect((yield* republished)?.usageLimits).toEqual(failed);
     }),
   );
+
+  it.effect(
+    "preserves observed email and plan across session starts and clears them on account switch",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness();
+        yield* harness.initialize;
+        yield* harness.provider.onAccountObserved({
+          email: "ultra@example.com",
+          planTier: "Google AI Ultra",
+        });
+        yield* harness.provider.onSessionStarted(started);
+        expect((yield* harness.provider.snapshot.getSnapshot).auth).toEqual({
+          status: "authenticated",
+          type: "oauth-personal",
+          label: "Google AI Ultra",
+          email: "ultra@example.com",
+        });
+
+        yield* harness.provider.onSignedIn;
+        const afterSignInSwitch = yield* harness.provider.snapshot.getSnapshot;
+        expect(afterSignInSwitch.auth.email).toBeUndefined();
+        expect(afterSignInSwitch.auth.label).toBe("Google account");
+
+        yield* harness.provider.onAccountObserved({
+          email: "other@example.com",
+          planTier: "Google AI Pro",
+        });
+        yield* harness.provider.onSignedOut;
+        const afterSignOut = yield* harness.provider.snapshot.getSnapshot;
+        expect(afterSignOut.auth.status).toBe("unauthenticated");
+        expect(afterSignOut.auth.email).toBeUndefined();
+      }),
+  );
 });

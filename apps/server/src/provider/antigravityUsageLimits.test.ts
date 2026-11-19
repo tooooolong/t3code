@@ -10,6 +10,7 @@ import * as Path from "effect/Path";
 import * as TestClock from "effect/testing/TestClock";
 import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/http";
 
+import type { AntigravityStatusLineReadResult } from "./antigravityStatusLineProbe.ts";
 import { makeAntigravityUsageProbe } from "./antigravityUsageLimits.ts";
 
 const summary = {
@@ -66,6 +67,11 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
     userInfoAt?: number;
     missingToken?: boolean;
     authMethod?: "oauth-personal" | "oauth-business" | "gemini-api-key";
+    readStatusLine?: Effect.Effect<AntigravityStatusLineReadResult>;
+    onAccountObserved?: (account: {
+      readonly email?: string;
+      readonly planTier?: string;
+    }) => Effect.Effect<void>;
   } = {},
 ) {
   const fs = yield* FileSystem.FileSystem;
@@ -132,6 +138,10 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
   const usage = yield* makeAntigravityUsageProbe({
     profileDirectory,
     authMethod: options.authMethod ?? "oauth-personal",
+    ...(options.readStatusLine !== undefined ? { readStatusLine: options.readStatusLine } : {}),
+    ...(options.onAccountObserved !== undefined
+      ? { onAccountObserved: options.onAccountObserved }
+      : {}),
   }).pipe(Effect.provideService(HttpClient.HttpClient, http));
   return { ...usage, requests, writeToken, tokenPath };
 });
@@ -661,6 +671,167 @@ describe("Antigravity subscription limits", () => {
         expect((yield* probe).unavailable?.reason).toBe("unsupported");
         expect(requests).toEqual([]);
       }
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("falls back to statusLine quota when acp_token.json is absent", () =>
+    Effect.gen(function* () {
+      const requestedAt = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-21T10:16:04Z"));
+      yield* TestClock.setTime(requestedAt);
+      const observed: Array<{ readonly email?: string; readonly planTier?: string }> = [];
+      const readStatusLine = Effect.succeed<AntigravityStatusLineReadResult>({
+        _tag: "ok",
+        requestedAt,
+        snapshot: {
+          version: "1.5.12",
+          email: "User@Example.com",
+          planTier: "Google AI Ultra",
+          buckets: [
+            {
+              bucketId: "3p-5h",
+              window: "5h",
+              remainingFraction: 1,
+              resetTime: "2026-10-21T15:16:05Z",
+            },
+            {
+              bucketId: "gemini-5h",
+              window: "5h",
+              remainingFraction: 0.85,
+              resetTime: "2026-10-21T13:29:53Z",
+            },
+            {
+              bucketId: "gemini-weekly",
+              window: "weekly",
+              remainingFraction: 0.96,
+              resetTime: "2026-10-28T08:29:53Z",
+            },
+          ],
+        },
+      });
+      const { probe, requests } = yield* fixture({
+        missingToken: true,
+        readStatusLine,
+        onAccountObserved: (account) =>
+          Effect.sync(() => {
+            observed.push(account);
+          }),
+      });
+      const limits = yield* probe;
+      expect(requests).toEqual([]);
+      expect(observed).toEqual([{ email: "User@Example.com", planTier: "Google AI Ultra" }]);
+      expect(limits.unavailable).toBeUndefined();
+      expect(limits.credentialFingerprint).toMatch(/^[0-9a-f]{64}$/);
+      expect(JSON.stringify(limits)).not.toMatch(/user@example\.com/i);
+      const byId = new Map(limits.windows.map((window) => [window.id, window]));
+      expect(byId.get("3p-5h")).toEqual({
+        id: "3p-5h",
+        label: "Claude & GPT (shared) · 5-hour",
+        kind: "session",
+        usedPercent: 0,
+        windowDurationMins: 300,
+      });
+      expect(byId.get("gemini-5h")?.usedPercent).toBeCloseTo(15);
+      expect(byId.get("gemini-5h")?.resetsAt).toBe("2026-10-21T13:29:53.000Z");
+      expect(byId.get("gemini-weekly")?.usedPercent).toBeCloseTo(4);
+      expect(byId.get("gemini-weekly")?.resetsAt).toBe("2026-10-28T08:29:53.000Z");
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("prefers acp_token.json over statusLine and maps fallback error states", () =>
+    Effect.gen(function* () {
+      let statusLineCalls = 0;
+      const withToken = yield* fixture({
+        readStatusLine: Effect.sync(() => {
+          statusLineCalls++;
+          return { _tag: "failed" } as const;
+        }),
+      });
+      expect((yield* withToken.probe).windows).toHaveLength(4);
+      expect(statusLineCalls).toBe(0);
+
+      for (const [result, expectedReason] of [
+        [{ _tag: "unsupported" }, "unsupported"],
+        [{ _tag: "failed" }, "probeFailed"],
+      ] as const) {
+        const { probe } = yield* fixture({
+          missingToken: true,
+          readStatusLine: Effect.succeed(result),
+        });
+        expect((yield* probe).unavailable?.reason).toBe(expectedReason);
+      }
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect(
+    "publishes observed email from legacy userinfo and handles amount-only statusLine quotas",
+    () =>
+      Effect.gen(function* () {
+        const observedLegacy: Array<{ readonly email?: string; readonly planTier?: string }> = [];
+        const legacy = yield* fixture({
+          userId: "google-user-99",
+          onAccountObserved: (account) =>
+            Effect.sync(() => {
+              observedLegacy.push(account);
+            }),
+        });
+        const legacyLimits = yield* legacy.probe;
+        expect(observedLegacy).toEqual([{ email: "someone@example.com" }]);
+        expect(JSON.stringify(legacyLimits)).not.toContain("someone@example.com");
+
+        const requestedAt = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-21T10:16:04Z"));
+        const observedAmount: Array<{ readonly email?: string; readonly planTier?: string }> = [];
+        const amountOnly = yield* fixture({
+          missingToken: true,
+          readStatusLine: Effect.succeed({
+            _tag: "ok",
+            requestedAt,
+            snapshot: {
+              email: "credits@example.com",
+              planTier: "Google AI Pro",
+              buckets: [{ bucketId: "credits", remainingAmount: 100 }],
+            },
+          }),
+          onAccountObserved: (account) =>
+            Effect.sync(() => {
+              observedAmount.push(account);
+            }),
+        });
+        const amountLimits = yield* amountOnly.probe;
+        expect(observedAmount).toEqual([
+          { email: "credits@example.com", planTier: "Google AI Pro" },
+        ]);
+        expect(amountLimits.windows).toEqual([]);
+        expect(amountLimits.unavailable?.reason).toBe("unsupported");
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("skips stale statusLine account updates when clear runs mid-probe", () =>
+    Effect.gen(function* () {
+      const requestedAt = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-21T10:16:04Z"));
+      const observed: Array<{ readonly email?: string; readonly planTier?: string }> = [];
+      let clearProbe: Effect.Effect<void> = Effect.void;
+      const { probe, clear } = yield* fixture({
+        missingToken: true,
+        readStatusLine: Effect.gen(function* () {
+          yield* clearProbe;
+          return {
+            _tag: "ok",
+            requestedAt,
+            snapshot: {
+              email: "stale@example.com",
+              planTier: "Google AI Pro",
+              buckets: [{ bucketId: "gemini-5h", window: "5h", remainingFraction: 0.5 }],
+            },
+          } as const;
+        }),
+        onAccountObserved: (account) =>
+          Effect.sync(() => {
+            observed.push(account);
+          }),
+      });
+      clearProbe = clear;
+      yield* probe;
+      expect(observed).toEqual([]);
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 });

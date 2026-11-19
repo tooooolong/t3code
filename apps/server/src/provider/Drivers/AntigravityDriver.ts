@@ -6,10 +6,11 @@ import {
   settingsSecretLiteral,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
-import { resolveSelfInvocation } from "@t3tools/shared/nodeRuntime";
 import {
   NodeRuntimeUnavailableError,
   nodeRuntimeUnavailableMessage,
+  resolveNodeExecutable,
+  resolveSelfInvocation,
 } from "@t3tools/shared/nodeRuntime";
 import * as Digest from "effect/crypto/Digest";
 import * as SecureRandom from "effect/crypto/SecureRandom";
@@ -67,6 +68,10 @@ import { makeAcpNativeLoggerFactory } from "@t3tools/provider-acp/server/nativeL
 import { ProviderDriverError } from "../Errors.ts";
 import * as PortScanner from "../../preview/PortScanner.ts";
 import { makeAntigravityProvider } from "../AntigravityProvider.ts";
+import {
+  readAntigravityStatusLine,
+  supportsAntigravityStatusLineQuota,
+} from "../antigravityStatusLineProbe.ts";
 import { makeAntigravityUsageProbe } from "../antigravityUsageLimits.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
@@ -450,9 +455,54 @@ export const AntigravityDriver: ProviderDriver<
       };
     });
 
+    const readStatusLine: Effect.Effect<
+      import("../antigravityStatusLineProbe.ts").AntigravityStatusLineReadResult
+    > = Effect.scoped(
+      Effect.gen(function* () {
+        const snapshot = yield* Effect.suspend(() => provider.snapshot.getSnapshot);
+        if (snapshot.auth.status === "unauthenticated") {
+          return { _tag: "unsupported" } as const;
+        }
+        const preview = yield* installation
+          .resolve(settings.binaryPath, processEnvironment)
+          .pipe(Effect.option);
+        if (preview._tag === "None" || !supportsAntigravityStatusLineQuota(preview.value)) {
+          return { _tag: "unsupported" } as const;
+        }
+        const nodeExecutable = yield* resolveNodeExecutable("Antigravity", processEnvironment).pipe(
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+          Effect.option,
+        );
+        if (nodeExecutable._tag === "None") {
+          return { _tag: "unsupported" } as const;
+        }
+        const executable = yield* installation
+          .acquire(settings.binaryPath, processEnvironment)
+          .pipe(Effect.option);
+        if (executable._tag === "None" || !supportsAntigravityStatusLineQuota(executable.value)) {
+          return { _tag: "unsupported" } as const;
+        }
+        return yield* readAntigravityStatusLine({
+          executablePath: executable.value.executablePath,
+          nodeExecutablePath: nodeExecutable.value,
+          profileDirectory,
+          baseEnv: processEnvironment,
+          ...(auth.authMethod === "oauth-business" && auth.gcpProject
+            ? { gcpProject: auth.gcpProject }
+            : {}),
+          ...(auth.authMethod === "oauth-business" && auth.gcpLocation
+            ? { gcpLocation: auth.gcpLocation }
+            : {}),
+        });
+      }),
+    );
     const usage = yield* makeAntigravityUsageProbe({
       profileDirectory,
       authMethod: auth.authMethod,
+      readStatusLine,
+      onAccountObserved: (account): Effect.Effect<void> =>
+        Effect.suspend(() => provider.onAccountObserved(account)),
     }).pipe(
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(Path.Path, path),

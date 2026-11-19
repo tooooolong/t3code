@@ -392,7 +392,13 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
           auth: {
             status: "authenticated",
             type: options.auth?.type ?? "oauth-personal",
-            label: options.auth?.label ?? "Google account",
+            label:
+              (draft.auth.status === "unauthenticated" ? undefined : draft.auth.label) ??
+              options.auth?.label ??
+              "Google account",
+            ...(draft.auth.status !== "unauthenticated" && draft.auth.email
+              ? { email: draft.auth.email }
+              : {}),
           },
           checkedAt: updatedAt,
           models: buildAntigravityModelsFromSession(started.sessionSetupResult, thinkingLevels),
@@ -521,9 +527,36 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
       : { ...snapshot, skills: resolvedSkills };
   });
 
+  const onAccountObserved = Effect.fn("AntigravityProvider.onAccountObserved")(function* (account: {
+    readonly email?: string;
+    readonly planTier?: string;
+  }) {
+    if (!account.email && !account.planTier) return;
+    yield* SubscriptionRef.update(metadata, (state) => {
+      if (state.draft.auth.status === "unauthenticated") return state;
+      const nextEmail = account.email ?? state.draft.auth.email;
+      const nextLabel = account.planTier ?? state.draft.auth.label;
+      if (nextEmail === state.draft.auth.email && nextLabel === state.draft.auth.label) {
+        return state;
+      }
+      return {
+        ...state,
+        draft: {
+          ...state.draft,
+          auth: {
+            ...state.draft.auth,
+            ...(nextEmail ? { email: nextEmail } : {}),
+            ...(nextLabel ? { label: nextLabel } : {}),
+          },
+        },
+      };
+    });
+  });
+
   return {
     snapshot: { ...managed, getSnapshot },
     onSessionStarted,
+    onAccountObserved,
     onConfigOptionsUpdated,
     onAvailableCommands,
     // The new sign-in may be another account. Clear and republish its limits so a failed read
@@ -532,7 +565,20 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
       Effect.andThen(
         SubscriptionRef.update(metadata, (state) => {
           const { usageLimits: _previousAccount, ...draft } = state.draft;
-          return { ...state, draft };
+          const { email: _previousEmail, label: _previousLabel, ...restAuth } = draft.auth;
+          const resetLabel =
+            options.auth?.label ??
+            (restAuth.status === "authenticated" ? "Google account" : undefined);
+          return {
+            ...state,
+            draft: {
+              ...draft,
+              auth: {
+                ...restAuth,
+                ...(resetLabel ? { label: resetLabel } : {}),
+              },
+            },
+          };
         }),
       ),
       Effect.andThen(

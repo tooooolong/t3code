@@ -380,19 +380,20 @@ const HUB_PROVIDERS = new Map<string, HubProvider>([
         if (windows.length === 0) {
           return yield* new UsageLimitSourceError({ detail: "No Antigravity quota reported." });
         }
-        // Local Antigravity reports no e-mail, so the Google account fingerprint is what pools the two.
+        // Provide both listed e-mail and Google ID fingerprint so statusLine, legacy ACP, and Hub merge.
         const fingerprint = yield* call("https://www.googleapis.com/oauth2/v2/userinfo").pipe(
           Effect.flatMap(decodeJson),
           Effect.flatMap(antigravityAccountFingerprint),
           Effect.option,
         );
         const usageLimits = makeUsageLimits({ checkedAt, windows });
-        return Option.match(fingerprint, {
-          onNone: () => ({ ...listedIdentity(account), usageLimits }),
-          onSome: (credentialFingerprint) => ({
-            usageLimits: { ...usageLimits, credentialFingerprint },
+        return {
+          ...listedIdentity(account),
+          usageLimits: Option.match(fingerprint, {
+            onNone: () => usageLimits,
+            onSome: (credentialFingerprint) => ({ ...usageLimits, credentialFingerprint }),
           }),
-        });
+        };
       }),
     },
   ],

@@ -440,6 +440,57 @@ describe("pools", () => {
     expect(accounts[0]?.limits.windows[0]?.usedPercent).toBe(30);
   });
 
+  it("merges statusLine, legacy ACP, and Hub Antigravity reports for the same Google account", () => {
+    const antigravity = ProviderDriverKind.make("antigravity");
+    const statusLineNative = provider({
+      driver: antigravity,
+      instanceId: ProviderInstanceId.make("antigravity-cli"),
+      auth: { status: "authenticated", email: "same@example.com", label: "Google AI Ultra" },
+      usageLimits: {
+        checkedAt,
+        credentialFingerprint: "email-hash-1",
+        windows: [{ ...window, id: "gemini-weekly", usedPercent: 20 }],
+      },
+    });
+    const legacyNative = provider({
+      driver: antigravity,
+      instanceId: ProviderInstanceId.make("antigravity-legacy"),
+      auth: { status: "authenticated" },
+      usageLimits: {
+        checkedAt: "2026-09-03T11:15:00.000Z",
+        credentialFingerprint: "google-id-hash",
+        windows: [{ ...window, id: "gemini-weekly", usedPercent: 25 }],
+      },
+    });
+    const hubWithBoth = {
+      id: "antigravity-same@example.com.json",
+      driver: antigravity,
+      email: "SAME@example.com",
+      usageLimits: {
+        checkedAt: "2026-09-03T11:30:00.000Z",
+        credentialFingerprint: "google-id-hash",
+        windows: [{ ...window, id: "gemini-weekly", usedPercent: 35 }],
+      },
+    };
+    const accounts = collectLimitAccounts(
+      new Map([
+        [
+          EnvironmentId.make("env-a"),
+          {
+            ...laptop,
+            serverConfig: {
+              providers: [statusLineNative, legacyNative],
+              usageLimitSources: [{ ...source, accounts: [hubWithBoth] }],
+            },
+          },
+        ],
+      ]),
+    );
+    expect(accounts).toHaveLength(1);
+    expect(accounts[0]?.limits.windows[0]?.usedPercent).toBe(35);
+    expect(accounts[0]?.plan).toBe("Google AI Ultra");
+  });
+
   it("takes windows from a fresher hub read but credits and redeem from the native instance", () => {
     const native = provider({
       driver: claude,
@@ -1273,6 +1324,69 @@ describe("pooled account columns", () => {
     expect.soft(claude?.windows.map((row) => row.remainingPercent)).toEqual([40, 1, 70]);
     expect.soft(cursor?.windows.map((row) => row.remainingPercent)).toEqual([60, 0, 80]);
     expect(accounts).toEqual(snapshot);
+  });
+
+  it("suppresses only the matching Antigravity model family 5h window when its weekly quota is spent", () => {
+    const weeklyReset = "2026-09-06T12:00:00.000Z";
+    const ag = {
+      ...account("ag", [
+        {
+          ...window,
+          id: "gemini-5h",
+          label: "Gemini · 5-hour",
+          usedPercent: 0,
+          resetsAt: undefined,
+        },
+        {
+          ...weekly,
+          id: "gemini-weekly",
+          label: "Gemini · Weekly",
+          usedPercent: 100,
+          resetsAt: weeklyReset,
+        },
+        {
+          ...window,
+          id: "3p-5h",
+          label: "Claude & GPT (shared) · 5-hour",
+          usedPercent: 20,
+        },
+        {
+          ...weekly,
+          id: "3p-weekly",
+          label: "Claude & GPT (shared) · Weekly",
+          usedPercent: 50,
+          resetsAt: weeklyReset,
+        },
+        {
+          ...window,
+          id: "gemini-carbon-5h",
+          label: "Gemini Carbon · 5-hour",
+          usedPercent: 20,
+        },
+        {
+          ...weekly,
+          id: "gemini-carbon-wtu-weekly",
+          label: "Gemini 4 Carbon · Weekly",
+          usedPercent: 100,
+          resetsAt: weeklyReset,
+        },
+      ]),
+      driver: ProviderDriverKind.make("antigravity"),
+    };
+    const [pool] = collectLimitPools([ag], now);
+    const byId = new Map(pool!.windows.map((row) => [row.id, row]));
+    expect(byId.get("gemini-5h")?.remainingPercent).toBe(0);
+    expect(byId.get("gemini-5h")?.resets[0]).toMatchObject({
+      at: Date.parse(weeklyReset),
+      restoresPercent: 100,
+    });
+    expect(byId.get("gemini-carbon-5h")?.remainingPercent).toBe(0);
+    expect(byId.get("gemini-carbon-5h")?.resets[0]).toMatchObject({
+      at: Date.parse(weeklyReset),
+      restoresPercent: 100,
+    });
+    expect(byId.get("3p-5h")?.remainingPercent).toBe(80);
+    expect(byId.get("3p-weekly")?.remainingPercent).toBe(50);
   });
 
   it("keeps session columns across rows with opposite reset and usage orders", () => {

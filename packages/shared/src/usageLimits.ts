@@ -213,13 +213,18 @@ export function collectExternalUsageLinks(
   return [...links.values()];
 }
 
-function accountKey(
+function emailAccountKey(
   driver: ServerProvider["driver"],
   email: string | undefined,
-  limits?: ServerProviderUsageLimits,
 ): string | null {
   const normalizedEmail = email?.trim().toLowerCase();
-  if (normalizedEmail) return `${driver}:${normalizedEmail}`;
+  return normalizedEmail ? `${driver}:${normalizedEmail}` : null;
+}
+
+function credentialAccountKey(
+  driver: ServerProvider["driver"],
+  limits?: ServerProviderUsageLimits,
+): string | null {
   return limits?.credentialFingerprint
     ? `${driver}:credential:${limits.credentialFingerprint}`
     : null;
@@ -241,15 +246,35 @@ const nativeReport = (provider: ServerProvider): AccountReport => ({
 
 // Include every enabled login, even unreadable workspaces.
 function accountKeyResolver(reports: Iterable<AccountReport>) {
+  const reportList = [...reports];
+  const emailByCredential = new Map<string, string | null>();
+  for (const report of reportList) {
+    const emailKey = emailAccountKey(report.driver, report.email);
+    const credentialKey = credentialAccountKey(report.driver, report.usageLimits);
+    if (!emailKey || !credentialKey) continue;
+    const existing = emailByCredential.get(credentialKey);
+    if (existing === undefined) {
+      emailByCredential.set(credentialKey, emailKey);
+    } else if (existing !== emailKey) {
+      emailByCredential.set(credentialKey, null);
+    }
+  }
+  const baseKey = (report: AccountReport): string | null => {
+    const emailKey = emailAccountKey(report.driver, report.email);
+    if (emailKey) return emailKey;
+    const credentialKey = credentialAccountKey(report.driver, report.usageLimits);
+    if (!credentialKey) return null;
+    return emailByCredential.get(credentialKey) ?? credentialKey;
+  };
   const workspaces = new Map<string, Set<string>>();
-  for (const report of reports) {
-    const key = accountKey(report.driver, report.email, report.usageLimits);
+  for (const report of reportList) {
+    const key = baseKey(report);
     if (key && report.workspaceId) {
       workspaces.set(key, (workspaces.get(key) ?? new Set()).add(report.workspaceId));
     }
   }
   return (report: AccountReport): string | null => {
-    const key = accountKey(report.driver, report.email, report.usageLimits);
+    const key = baseKey(report);
     if (!key) return null;
     if (report.workspaceId) return `${key}:${report.workspaceId}`;
     const known = workspaces.get(key);
@@ -481,14 +506,16 @@ function hasDuplicateCursorTotal(pool: LimitPool): boolean {
   );
 }
 
+function antigravityFamilyKey(bucketId: string): string {
+  return bucketId.replace(/-(?:wtu-)?(?:5h|weekly|quota)$/, "");
+}
+
 export function displayLimitWindows(pool: LimitPool) {
   if (pool.driver === "antigravity") {
     return [...pool.windows].sort(
       (left, right) =>
         Number(!left.id.startsWith("gemini-")) - Number(!right.id.startsWith("gemini-")) ||
-        left.id
-          .replace(/-(5h|weekly|quota)$/, "")
-          .localeCompare(right.id.replace(/-(5h|weekly|quota)$/, "")) ||
+        antigravityFamilyKey(left.id).localeCompare(antigravityFamilyKey(right.id)) ||
         WINDOW_KIND_ORDER[left.kind] - WINDOW_KIND_ORDER[right.kind],
     );
   }
@@ -577,7 +604,11 @@ function poolMember(account: LimitAccount, reported: ServerProviderUsageWindow, 
             window.usedPercent >= 100 &&
             (account.driver === "claudeAgent"
               ? window.id === "seven_day"
-              : account.driver === "codex" && window.kind === "weekly"),
+              : account.driver === "codex"
+                ? window.kind === "weekly"
+                : account.driver === "antigravity" &&
+                  window.kind === "weekly" &&
+                  antigravityFamilyKey(window.id) === antigravityFamilyKey(reported.id)),
         )
       : undefined;
   if (!spentWeekly) return { account, window: reported, refillPercent: reported.usedPercent };
@@ -587,22 +618,23 @@ function poolMember(account: LimitAccount, reported: ServerProviderUsageWindow, 
   const cutoff = Math.max(now, Date.parse(account.limits.checkedAt));
   let resetsAt: string | undefined;
   let refillPercent = 0;
-  // A stale or missing clock cannot tell us when blocked quota becomes usable.
-  if (
-    weeklyReset !== null &&
-    sessionReset !== null &&
-    weeklyReset > cutoff &&
-    sessionReset > cutoff
-  ) {
-    if (sessionReset <= weeklyReset) {
+  // A stale or missing clock cannot tell us when blocked quota becomes usable, except an
+  // untouched rolling session window whose full capacity is ready as soon as the weekly quota resets.
+  if (weeklyReset !== null && weeklyReset > cutoff) {
+    if (reported.resetsAt === undefined && reported.usedPercent <= 0) {
       resetsAt = spentWeekly.resetsAt;
       refillPercent = 100;
-    } else if (reported.usedPercent >= 100) {
-      resetsAt = reported.resetsAt;
-      refillPercent = 100;
-    } else {
-      resetsAt = spentWeekly.resetsAt;
-      refillPercent = 100 - Math.max(0, Math.min(100, reported.usedPercent));
+    } else if (sessionReset !== null && sessionReset > cutoff) {
+      if (sessionReset <= weeklyReset) {
+        resetsAt = spentWeekly.resetsAt;
+        refillPercent = 100;
+      } else if (reported.usedPercent >= 100) {
+        resetsAt = reported.resetsAt;
+        refillPercent = 100;
+      } else {
+        resetsAt = spentWeekly.resetsAt;
+        refillPercent = 100 - Math.max(0, Math.min(100, reported.usedPercent));
+      }
     }
   }
   return {
