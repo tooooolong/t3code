@@ -959,6 +959,81 @@ effectIt.effect.each(["linux", "darwin"] as const)(
   },
 );
 
+effectIt.effect.each(["linux", "darwin"] as const)(
+  "ignores listeners bound by registered agent CLI pids on %s while keeping ACP terminal and child servers",
+  (platform) => {
+    const agentCliPid = 56_077;
+    const acpTerminalServerPid = 56_150;
+    const devServerPid = 56_200;
+    const lsofStdout =
+      `p${agentCliPid}\ncantigravity\nn127.0.0.1:49736\nn127.0.0.1:49737\n` +
+      `p${acpTerminalServerPid}\ncnode\nn127.0.0.1:3000\n` +
+      `p${devServerPid}\ncnode\nn127.0.0.1:5173\n`;
+    const missing = FileSystem.makeNoop({});
+    const procFiles: Record<string, string> = {
+      [`/proc/${agentCliPid}/environ`]: `${PortScanner.AGENT_THREAD_ENV}=thread-agent\0`,
+      [`/proc/${acpTerminalServerPid}/environ`]: `${PortScanner.AGENT_THREAD_ENV}=thread-agent\0`,
+      [`/proc/${devServerPid}/environ`]: `${PortScanner.AGENT_THREAD_ENV}=thread-agent\0`,
+    };
+    const layer = layerScanner.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          FileSystem.layerNoop({
+            readFileString: (path) => {
+              const content = procFiles[path];
+              return content === undefined ? missing.readFileString(path) : Effect.succeed(content);
+            },
+          }),
+          Layer.succeed(ProcessRunner.ProcessRunner, {
+            run: (input) => {
+              if (input.command === "lsof") return Effect.succeed(processOutput(lsofStdout));
+              return Effect.succeed(
+                processOutput(
+                  `  ${acpTerminalServerPid} node server.js ${PortScanner.AGENT_THREAD_ENV}=thread-agent\n` +
+                    `  ${devServerPid} node vite.js ${PortScanner.AGENT_THREAD_ENV}=thread-agent\n`,
+                ),
+              );
+            },
+          }),
+          Layer.succeed(HostProcess.Platform, platform),
+          FetchHttpClient.layer.pipe(
+            Layer.provide(
+              Layer.succeed(FetchHttpClient.Fetch, () =>
+                Promise.resolve(new Response("ok", { headers: { "content-type": "text/html" } })),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    return Effect.gen(function* () {
+      const scanner = yield* PortScanner.PortDiscovery;
+      scanner.trackAgent({ pid: agentCliPid });
+      expect(yield* scanner.scan()).toEqual([
+        {
+          host: "localhost",
+          port: 3000,
+          url: "http://localhost:3000",
+          processName: "node",
+          pid: acpTerminalServerPid,
+          terminal: null,
+          agent: { threadId: "thread-agent" },
+        },
+        {
+          host: "localhost",
+          port: 5173,
+          url: "http://localhost:5173",
+          processName: "node",
+          pid: devServerPid,
+          terminal: null,
+          agent: { threadId: "thread-agent" },
+        },
+      ]);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
 effectIt.effect("stops only a job's own process group", () =>
   Effect.sync(() => {
     const serverPid = 100;

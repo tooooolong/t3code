@@ -17,6 +17,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
@@ -64,6 +65,7 @@ import {
 } from "../../orchestration-v2/Adapters/AntigravityAdapterV2.ts";
 import { makeAcpNativeLoggerFactory } from "@t3tools/provider-acp/server/nativeLogging";
 import { ProviderDriverError } from "../Errors.ts";
+import * as PortScanner from "../../preview/PortScanner.ts";
 import { makeAntigravityProvider } from "../AntigravityProvider.ts";
 import { makeAntigravityUsageProbe } from "../antigravityUsageLimits.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
@@ -134,6 +136,7 @@ export const AntigravityDriver: ProviderDriver<
     const httpClient = yield* HttpClient.HttpClient;
     const path = yield* Path.Path;
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const portDiscovery = yield* Effect.serviceOption(PortScanner.PortDiscovery);
     const host = yield* ProviderHost.ProviderHost;
     const selfInvocation = yield* resolveSelfInvocation();
     const installation = yield* AntigravityInstallation.AntigravityInstallation;
@@ -277,11 +280,23 @@ export const AntigravityDriver: ProviderDriver<
         threadEnvironment === undefined
           ? processEnvironment
           : { ...processEnvironment, ...threadEnvironment };
+      const runtimeSpawner = Option.match(portDiscovery, {
+        onNone: () => spawner,
+        onSome: (discovery) =>
+          ChildProcessSpawner.make(
+            Effect.fnUntraced(function* (command) {
+              const handle = yield* spawner.spawn(command);
+              const release = discovery.trackAgent({ pid: handle.pid });
+              yield* Effect.addFinalizer(() => Effect.sync(release));
+              return handle;
+            }),
+          ),
+      });
       const runtime = yield* makeAntigravityAcpRuntime({
         ...runtimeInput,
         runtimeVersion: executable.version,
         authMethod: auth.authMethod,
-        childProcessSpawner: spawner,
+        childProcessSpawner: runtimeSpawner,
         spawn: buildAntigravityAcpSpawnInput({
           installation: executable,
           profile,
