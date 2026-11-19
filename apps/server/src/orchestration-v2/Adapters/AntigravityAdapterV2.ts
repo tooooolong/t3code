@@ -28,6 +28,10 @@ import {
   type AntigravityAcpRuntimeInput,
 } from "../../provider/acp/AntigravityAcpSupport.ts";
 import {
+  hasAntigravityPendingBackgroundWork,
+  isAntigravityContinuationStillActive,
+} from "../../provider/acp/AntigravityBackgroundWork.ts";
+import {
   ANTIGRAVITY_SUBAGENT_BATCH_TITLE,
   antigravitySubagentLaunches,
   describeAntigravitySubagentLaunches,
@@ -284,6 +288,8 @@ export function makeAntigravityAcpAdapterFlavor(
     requiresSignIn: isAntigravitySignInRequiredError,
     // Antigravity can leave a prompt open without updates; long tools and approvals pause this.
     promptInactivityTimeout: "15 minutes",
+    // Background commands and subagents wake Antigravity after `session/prompt` settles.
+    enablePostSettleContinuation: true,
     // 1.4.5 returns the root trajectory's Gemini usageMetadata delta; 1.4.1 returns none.
     reportsPerTurnPromptUsage: true,
     geminiPromptUsage: true,
@@ -292,6 +298,10 @@ export function makeAntigravityAcpAdapterFlavor(
       : {
           watchPromptOutcome: (sessionId: string) =>
             watchAntigravityPromptOutcome(profileDirectory, sessionId),
+          hasPendingBackgroundWork: (sessionId: string) =>
+            hasAntigravityPendingBackgroundWork(profileDirectory, sessionId),
+          isContinuationStillActive: (sessionId: string) =>
+            isAntigravityContinuationStillActive(profileDirectory, sessionId),
         }),
   };
 }

@@ -11483,6 +11483,136 @@ describe("AcpAdapterV2", () => {
         );
       }).pipe(Effect.provide(layerTest)),
   );
+
+  it.effect(
+    "pauses continuation debounce while a foreground tool is in progress and finalizes after it completes",
+    () =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const selfInvocation = yield* resolveSelfInvocation();
+        const mockAgentPath = yield* bundledMockAgentPath;
+        const continuationOffers =
+          yield* Queue.unbounded<ProviderContinuationRequests.ProviderContinuationRequest>();
+        type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+        let sessionUpdateHandler: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
+        const instanceId = ProviderInstanceId.make("acp-continuation-fg-tool");
+        const adapter = yield* makeAcpAdapterV2({
+          instanceId,
+          flavor: {
+            driver: ACP_TEST_DRIVER,
+            capabilities: AcpProviderCapabilitiesV2,
+            enablePostSettleContinuation: true,
+            makeRuntime: makeMockRuntime({
+              childProcessSpawner,
+              mockAgentPath,
+              wrapRuntime: (runtime) => ({
+                ...runtime,
+                handleSessionUpdate: (handler) =>
+                  Effect.sync(() => {
+                    sessionUpdateHandler = handler;
+                  }).pipe(Effect.andThen(runtime.handleSessionUpdate(handler))),
+                prompt: () => Effect.succeed({ stopReason: "end_turn" as const }),
+              }),
+            }),
+          },
+          selfInvocation,
+          continuationRequests: {
+            offer: (request) => Queue.offer(continuationOffers, request).pipe(Effect.asVoid),
+          },
+        });
+        const threadId = ThreadId.make("thread-acp-continuation-fg-tool");
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: process.cwd(),
+        });
+        const modelSelection = { instanceId, model: "default" } as const;
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-acp-continuation-fg-tool"),
+          modelSelection,
+          runtimePolicy,
+        });
+        const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+        yield* runtime.events.pipe(
+          Stream.runForEach((event) => Queue.offer(events, event)),
+          Effect.forkScoped,
+        );
+        const providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const now = yield* DateTime.now;
+        yield* runtime.startTurn(
+          makeTurnInput({ threadId, providerThread, instanceId, runtimePolicy, now, ordinal: 1 }),
+        );
+        while (true) {
+          const event = yield* Queue.take(events);
+          if (event.type === "turn.terminal") break;
+        }
+        const send = sessionUpdateHandler!;
+        yield* send({
+          sessionId: "mock-session-1",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Background finished, running checks." },
+          },
+        });
+        yield* Queue.take(continuationOffers);
+        const turn2Input = makeTurnInput({
+          threadId,
+          providerThread,
+          instanceId,
+          runtimePolicy,
+          now,
+          ordinal: 2,
+        });
+        yield* runtime.startTurn({
+          ...turn2Input,
+          message: {
+            ...turn2Input.message,
+            createdBy: "agent",
+            creationSource: "provider",
+            text: "",
+          },
+        });
+        // Start an in-progress foreground tool during the continuation turn.
+        yield* send({
+          sessionId: "mock-session-1",
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: "fg-cmd-1",
+            title: "Run tests",
+            kind: "execute",
+            status: "in_progress",
+          },
+        });
+        const terminalFiber = yield* Effect.gen(function* () {
+          while (true) {
+            const event = yield* Queue.take(events);
+            if (event.type === "turn.terminal") return event;
+          }
+        }).pipe(Effect.forkScoped);
+
+        // Advancing past 3s debounce while fg-cmd-1 is still in_progress must NOT finalize.
+        yield* TestClock.adjust("6000 millis");
+        assert.isUndefined(terminalFiber.pollUnsafe());
+
+        // Once the foreground tool completes, the continuation turn finalizes after debounce.
+        yield* send({
+          sessionId: "mock-session-1",
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "fg-cmd-1",
+            status: "completed",
+          },
+        });
+        yield* TestClock.adjust("3100 millis");
+        const terminal = yield* Fiber.join(terminalFiber);
+        assert.equal(terminal.status, "completed");
+      }).pipe(Effect.provide(layerTest)),
+  );
 });
 
 describe("acpPostSettleContinuationOfferEvidence", () => {
