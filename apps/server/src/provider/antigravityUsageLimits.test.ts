@@ -10,6 +10,7 @@ import * as Path from "effect/Path";
 import * as TestClock from "effect/testing/TestClock";
 import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/http";
 
+import type { AntigravityStatusLineRead } from "./antigravityStatusLine.ts";
 import { makeAntigravityUsageProbe } from "./antigravityUsageLimits.ts";
 
 const summary = {
@@ -66,6 +67,8 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
     userInfoAt?: number;
     missingToken?: boolean;
     authMethod?: "oauth-personal" | "oauth-business" | "gemini-api-key";
+    readStatusLine?: Effect.Effect<AntigravityStatusLineRead>;
+    observed?: Array<{ email: string | undefined; planTier: string | undefined }>;
   } = {},
 ) {
   const fs = yield* FileSystem.FileSystem;
@@ -132,6 +135,8 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
   const usage = yield* makeAntigravityUsageProbe({
     profileDirectory,
     authMethod: options.authMethod ?? "oauth-personal",
+    ...(options.readStatusLine ? { readStatusLine: options.readStatusLine } : {}),
+    onAccountObserved: (account) => Effect.sync(() => options.observed?.push(account)),
   }).pipe(Effect.provideService(HttpClient.HttpClient, http));
   return { ...usage, requests, writeToken, tokenPath };
 });
@@ -663,4 +668,120 @@ describe("Antigravity subscription limits", () => {
       }
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
+
+  describe("without acp_token.json, as the 1.5+ CLI keeps its credential in the keyring", () => {
+    const observedAt = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-21T10:16:04Z"));
+    const read = (planTier?: string, email = "Someone@Example.com"): AntigravityStatusLineRead => ({
+      _tag: "read",
+      observedAt,
+      statusLine: {
+        email,
+        planTier,
+        buckets: [
+          // Untouched: the rolling reset one window from the read is omitted, as for summaries.
+          {
+            bucketId: "3p-5h",
+            window: "5h",
+            remainingFraction: 1,
+            resetTime: "2026-10-21T15:16:05Z",
+          },
+          {
+            bucketId: "gemini-weekly",
+            window: "weekly",
+            remainingFraction: 0.25,
+            resetTime: "2026-10-28T08:29:53Z",
+          },
+        ],
+      },
+    });
+
+    it.effect(
+      "reads limits from the CLI statusLine and reports the account without leaking it",
+      () =>
+        Effect.gen(function* () {
+          yield* TestClock.setTime(observedAt);
+          const observed: Array<{ email: string | undefined; planTier: string | undefined }> = [];
+          const { probe, requests } = yield* fixture({
+            missingToken: true,
+            readStatusLine: Effect.succeed(read("Google AI Ultra")),
+            observed,
+          });
+          const limits = yield* probe;
+          expect(requests).toEqual([]);
+          expect(observed).toEqual([{ email: "Someone@Example.com", planTier: "Google AI Ultra" }]);
+          expect(limits.unavailable).toBeUndefined();
+          expect(limits.windows).toEqual([
+            {
+              id: "3p-5h",
+              label: "Claude & GPT (shared) · 5-hour",
+              kind: "session",
+              usedPercent: 0,
+              windowDurationMins: 300,
+            },
+            {
+              id: "gemini-weekly",
+              label: "Gemini · Weekly",
+              kind: "weekly",
+              usedPercent: 75,
+              windowDurationMins: 10080,
+              resetsAt: "2026-10-28T08:29:53.000Z",
+            },
+          ]);
+          // One account reads the same however its e-mail is cased.
+          const other = yield* fixture({
+            missingToken: true,
+            readStatusLine: Effect.succeed(read(undefined, "someone@example.com")),
+          });
+          expect((yield* other.probe).credentialFingerprint).toBe(limits.credentialFingerprint);
+          expect(JSON.stringify(limits)).not.toMatch(/someone@example\.com/i);
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+        ),
+    );
+
+    it.effect(
+      "keeps the last read on a failed statusLine and the token probe when the file exists",
+      () =>
+        Effect.gen(function* () {
+          const failed = yield* fixture({
+            missingToken: true,
+            readStatusLine: Effect.succeed({ _tag: "failed" }),
+          });
+          expect((yield* failed.probe).unavailable?.reason).toBe("probeFailed");
+          const unsupported = yield* fixture({
+            missingToken: true,
+            readStatusLine: Effect.succeed({ _tag: "unsupported" }),
+          });
+          expect((yield* unsupported.probe).unavailable?.reason).toBe("unsupported");
+          let statusLineReads = 0;
+          const withToken = yield* fixture({
+            readStatusLine: Effect.sync(() => {
+              statusLineReads += 1;
+              return read();
+            }),
+          });
+          expect((yield* withToken.probe).windows).toHaveLength(4);
+          expect(statusLineReads).toBe(0);
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+        ),
+    );
+
+    it.effect("does not report an account read across a sign-in or sign-out", () =>
+      Effect.gen(function* () {
+        const observed: Array<{ email: string | undefined; planTier: string | undefined }> = [];
+        let clear: Effect.Effect<void> = Effect.void;
+        const usage = yield* fixture({
+          missingToken: true,
+          readStatusLine: Effect.suspend(() => clear).pipe(Effect.as(read("Google AI Pro"))),
+          observed,
+        });
+        clear = usage.clear;
+        yield* usage.probe;
+        expect(observed).toEqual([]);
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+    );
+  });
 });

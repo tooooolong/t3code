@@ -4,9 +4,11 @@ import {
   ProviderDriverKind,
   ProviderSetupError,
   settingsSecretLiteral,
+  type ServerProvider,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
-import { resolveSelfInvocation } from "@t3tools/shared/nodeRuntime";
+import * as PtyAdapter from "@t3tools/shared/PtyAdapter";
+import { resolveNodeExecutable, resolveSelfInvocation } from "@t3tools/shared/nodeRuntime";
 import {
   NodeRuntimeUnavailableError,
   nodeRuntimeUnavailableMessage,
@@ -17,6 +19,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
@@ -65,6 +68,11 @@ import {
 import { makeAcpNativeLoggerFactory } from "@t3tools/provider-acp/server/nativeLogging";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeAntigravityProvider } from "../AntigravityProvider.ts";
+import {
+  readAntigravityStatusLine,
+  supportsAntigravityStatusLine,
+  type AntigravityStatusLineRead,
+} from "../antigravityStatusLine.ts";
 import { makeAntigravityUsageProbe } from "../antigravityUsageLimits.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
@@ -435,9 +443,44 @@ export const AntigravityDriver: ProviderDriver<
       };
     });
 
+    // The 1.5+ CLI keeps its credential in the OS keyring, so its limits come from its statusLine.
+    const ptyAdapter = yield* Effect.serviceOption(PtyAdapter.PtyAdapter);
+    const readStatusLine: Effect.Effect<AntigravityStatusLineRead> = Effect.gen(function* () {
+      const snapshot = yield* Effect.suspend(
+        (): Effect.Effect<ServerProvider> => provider.snapshot.getSnapshot,
+      );
+      if (snapshot.auth.status === "unauthenticated" || Option.isNone(ptyAdapter)) {
+        return { _tag: "unsupported" } as const;
+      }
+      const nodeExecutable = yield* resolveNodeExecutable("Antigravity", processEnvironment).pipe(
+        Effect.option,
+      );
+      if (Option.isNone(nodeExecutable)) return { _tag: "unsupported" } as const;
+      // The lease keeps an update from removing the version directory while the CLI runs.
+      const executable = yield* installation.acquire(settings.binaryPath, processEnvironment);
+      const resolvedPath = yield* fileSystem
+        .realPath(executable.executablePath)
+        .pipe(Effect.orElseSucceed(() => executable.executablePath));
+      if (!supportsAntigravityStatusLine(executable, resolvedPath)) {
+        return { _tag: "unsupported" } as const;
+      }
+      return yield* readAntigravityStatusLine({
+        executablePath: executable.executablePath,
+        nodeExecutable: nodeExecutable.value,
+        environment: processEnvironment,
+      }).pipe(Effect.provideService(PtyAdapter.PtyAdapter, ptyAdapter.value));
+    }).pipe(
+      Effect.scoped,
+      Effect.orElseSucceed(() => ({ _tag: "unsupported" }) as const),
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+      Effect.provideService(Path.Path, path),
+    );
     const usage = yield* makeAntigravityUsageProbe({
       profileDirectory,
       authMethod: auth.authMethod,
+      readStatusLine,
+      onAccountObserved: (account): Effect.Effect<void> =>
+        Effect.suspend(() => provider.onAccountObserved(account)),
     }).pipe(
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(Path.Path, path),

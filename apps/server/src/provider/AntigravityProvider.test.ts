@@ -872,4 +872,26 @@ it.layer(makeLayerTest(true))("Antigravity periodic health checks", (it) => {
       expect(auth.at(-1)).toBe("unauthenticated");
     }),
   );
+
+  it.effect("shows the statusLine account through sessions and forgets it on a new sign-in", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      yield* harness.initialize;
+      yield* harness.provider.onAccountObserved({
+        email: "ultra@example.com",
+        planTier: "Google AI Ultra",
+      });
+      yield* harness.provider.onSessionStarted(started);
+      expect((yield* harness.provider.snapshot.getSnapshot).auth).toMatchObject({
+        status: "authenticated",
+        email: "ultra@example.com",
+        label: "Google AI Ultra",
+      });
+      yield* harness.provider.onSignedIn;
+      yield* harness.provider.onSessionStarted(started);
+      const auth = (yield* harness.provider.snapshot.getSnapshot).auth;
+      expect(auth.email).toBeUndefined();
+      expect(auth.label).not.toBe("Google AI Ultra");
+    }),
+  );
 });

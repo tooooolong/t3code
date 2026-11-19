@@ -15,6 +15,8 @@ import {
   makeUsageLimits,
 } from "@t3tools/provider-core/server/usageLimits";
 
+import type { AntigravityStatusLineRead } from "./antigravityStatusLine.ts";
+
 export function antigravityUserAgent(platform: NodeJS.Platform, architecture: NodeJS.Architecture) {
   return `antigravity/hub/2.24.0 (aidev_client; os_type=${platform}; arch=${architecture}; cl=963137146)`;
 }
@@ -210,6 +212,12 @@ function modelWindows(models: typeof Models.Type) {
 export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(function* (input: {
   readonly profileDirectory: string;
   readonly authMethod: AntigravitySettings["authMethod"];
+  /** Reads the CLI's statusLine; the 1.5+ CLI keeps its credential in the OS keyring. */
+  readonly readStatusLine?: Effect.Effect<AntigravityStatusLineRead>;
+  readonly onAccountObserved?: (account: {
+    readonly email: string | undefined;
+    readonly planTier: string | undefined;
+  }) => Effect.Effect<void>;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -238,6 +246,35 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
     }
     if (!(yield* fs.exists(tokenPath))) {
       cached = undefined;
+      const status = input.readStatusLine ? yield* input.readStatusLine : undefined;
+      if (status?._tag === "failed") {
+        return makeUnavailableUsageLimits({
+          checkedAt,
+          reason: "probeFailed",
+          message: "Could not read Antigravity limits. Refresh provider status to retry.",
+        });
+      }
+      if (status?._tag === "read") {
+        const { email, planTier } = status.statusLine;
+        // A sign-in or sign-out during the read may be another account.
+        if (generation === startedGeneration && input.onAccountObserved) {
+          yield* input.onAccountObserved({ email, planTier });
+        }
+        const windows = summaryWindows({ buckets: status.statusLine.buckets }, status.observedAt);
+        if (windows.length === 0) {
+          return makeUnavailableUsageLimits({
+            checkedAt,
+            reason: "probeFailed",
+            message: "Antigravity did not return usable quota information.",
+          });
+        }
+        return {
+          ...makeUsageLimits({ checkedAt, windows }),
+          ...(email
+            ? { credentialFingerprint: yield* sha256(`google-email\0${email.toLowerCase()}`) }
+            : {}),
+        };
+      }
       return makeUnavailableUsageLimits({
         checkedAt,
         reason: "unsupported",

@@ -271,6 +271,27 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
   const resetUsage = Effect.gen(function* () {
     yield* FiberHandle.clear(usageRead);
     if (options.clearUsage) yield* options.clearUsage;
+    observedAccount = {};
+  });
+  // The CLI's statusLine is the only source of the account's e-mail and plan; sessions report neither.
+  let observedAccount: { readonly email?: string; readonly planTier?: string } = {};
+  const accountAuth = () => ({
+    label: observedAccount.planTier ?? options.auth?.label ?? "Google account",
+    ...(observedAccount.email ? { email: observedAccount.email } : {}),
+  });
+  const onAccountObserved = Effect.fn("AntigravityProvider.onAccountObserved")(function* (account: {
+    readonly email: string | undefined;
+    readonly planTier: string | undefined;
+  }) {
+    observedAccount = {
+      ...(account.email ? { email: account.email } : {}),
+      ...(account.planTier ? { planTier: account.planTier } : {}),
+    };
+    yield* SubscriptionRef.update(metadata, (state) =>
+      state.draft.auth.status === "unauthenticated"
+        ? state
+        : { ...state, draft: { ...state.draft, auth: { ...state.draft.auth, ...accountAuth() } } },
+    );
   });
 
   const checkProvider = Effect.fn("checkAntigravityProvider")(function* () {
@@ -402,7 +423,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
           auth: {
             status: "authenticated",
             type: options.auth?.type ?? "oauth-personal",
-            label: options.auth?.label ?? "Google account",
+            ...accountAuth(),
           },
           checkedAt: updatedAt,
           models: buildAntigravityModelsFromSession(started.sessionSetupResult, thinkingLevels),
@@ -534,6 +555,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
   return {
     snapshot: { ...managed, getSnapshot },
     onSessionStarted,
+    onAccountObserved,
     onConfigOptionsUpdated,
     onAvailableCommands,
     // The new sign-in may be another account. Clear and republish its limits so a failed read
@@ -542,7 +564,14 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
       Effect.andThen(
         SubscriptionRef.update(metadata, (state) => {
           const { usageLimits: _previousAccount, ...draft } = state.draft;
-          return { ...state, draft };
+          const { email: _previousEmail, ...auth } = draft.auth;
+          return {
+            ...state,
+            draft: {
+              ...draft,
+              auth: auth.status === "unauthenticated" ? auth : { ...auth, ...accountAuth() },
+            },
+          };
         }),
       ),
       Effect.andThen(
